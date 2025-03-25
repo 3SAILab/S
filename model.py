@@ -17,15 +17,15 @@ class LMConfig(PretrainedConfig):
 
     def __init__(
         self,
-        dim: int = 768,
-        n_layers: int = 16,
-        n_heads: int = 16,
-        n_kv_heads: int = 2,
-        vocab_size: int = -1,
+        dim: int = 1536,
+        n_layers: int = 32,
+        n_heads: int = 32,
+        n_kv_heads: int = 4,
+        vocab_size: int = 151664,
         hidden_dim: int = None,
         multiple_of: int = 64,
         norm_eps: float = 1e6,
-        max_seq_len: int = 8192,
+        max_seq_len: int = 2048,
         rope_theta: int = 1e6,
         **kwargs
     ):
@@ -259,10 +259,36 @@ class SLM(PreTrainedModel):
                 break
             yield input_ids[:, start:]  # 仅返回新生成的令牌
 
+def print_model_parameters(model):
+    print("Layer Name & Parameters")
+    print("-----------------------------")
+    total_params = 0
+    for name, parameter in model.named_parameters():
+        param_size = parameter.size()
+        param_count = torch.prod(torch.tensor(param_size)).item()
+        total_params += param_count
+        print(f"{name:50} | Size: {str(param_size):30} | Count: {str(param_count):20}")
+    print("-----------------------------")
+    print(f"Total Parameters: {total_params} ({total_params / 1000000:.1f} M)")
+
 if __name__ == "__main__":
-    LMConfig_Dense = LMConfig(n_layers=2)
-    LMConfig_Dense.vocab_size = 10
+    LMConfig_Dense = LMConfig()
     S_Dense = SLM(LMConfig_Dense)
-    input_ids = torch.Tensor([1, 3, 5, 7]).long().reshape(1,  4)
-    out = S_Dense.generate(input_ids, max_new_tokens=10, use_cache=True)
-    print(f'生成结果：{out}')
+
+    # 生成测试输入 - 形状为 (4, 2047) 的整数张量，值在 0-999 之间
+    test_input = torch.randint(low=0, high=151643, size=(4, 2047))
+    
+    # 测试模型
+    with torch.no_grad():
+        # 前向传播
+        output = S_Dense(test_input)
+        logits = output.logits
+        # 检查输出形状
+        print(f"Output shape: {logits.shape}")  # 应该是 (4, 2047, vocab_size)
+        
+        # 检查输出值
+        print(f"Sample output values (first 5 of first sequence):")
+        # 检查概率分布是否合理
+        probs = torch.softmax(logits, dim=-1)
+        print("\nProbability sums (should be ~1.0):")
+        print(probs[0, :5, :].sum(dim=-1))  # 检查概率是否归一化
