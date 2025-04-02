@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-author: shouqinguan
-date: 2025-3-21
-description: S architecture of a language model
+@Author: ShouqinGuan
+description: 3S architecture of a language model
 """
 from typing import Optional, Tuple, List
 
@@ -13,7 +12,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class LMConfig(PretrainedConfig):
-    model_type = "S"
+    model_type = "3S"
 
     def __init__(
         self,
@@ -51,13 +50,12 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor):
         return self.weight * (x.float() * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)).type_as(x)
         
-def percompute_pos_cis(dim: int, end: int, theta: float = 10000.0):
-    # TODO why freqs
+# 修复 percompute_pos_cis 函数名拼写错误和注释
+def precompute_pos_cis(dim: int, end: int, theta: float = 10000.0):
+    """预计算位置编码的复数表示"""
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)
-    # TODO why outer
     freqs = torch.outer(t, freqs).float()
-    # TODO why polar
     pos_cis = torch.polar(torch.ones_like(freqs), freqs)
     return pos_cis
 
@@ -92,39 +90,58 @@ class Attention(nn.Module):
         self.n_kv_heads = config.n_heads if config.n_kv_heads is None else config.n_kv_heads
         assert config.n_heads % self.n_kv_heads == 0
         self.n_local_heads = config.n_heads
-        self.n_local_kv_heads = config.n_kv_heads
+        self.n_local_kv_heads = self.n_kv_heads  # 修正变量名
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = config.dim // config.n_heads
 
         self.wq = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(config.dim, config.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(config.dim, config.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)  # 修正输入输出维度
     
     def forward(self, x: torch.Tensor, pos_cis: torch.Tensor, past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, use_cache=False):
-        # TODO kv_cache why
         bs, seq_len, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(bs, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bs, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bs, seq_len, self.n_local_kv_heads, self.head_dim)
-        xq, xv = apply_rotary_emb(xq, xk, pos_cis)
+        
+        # 修复这里的错误，应该是xq和xk应用旋转位置编码
+        xq, xk = apply_rotary_emb(xq, xk, pos_cis)
 
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
+        
+        # 转置维度以适应注意力计算
         xq, xk, xv = (
             xq.transpose(1, 2),
             repeat_kv(xk, self.n_rep).transpose(1, 2),
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
 
-        output = F.scaled_dot_product_attention(
-            xq, xk, xv,
-            attn_mask=None,
-            is_causal=True
-        )
+        # 使用新的 torch.nn.attention.sdpa_kernel 替代旧的 sdp_kernel
+        try:
+            # 尝试使用新的 API
+            from torch.nn.attention import sdpa_kernel
+            with sdpa_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
+                output = F.scaled_dot_product_attention(
+                    xq, xk, xv,
+                    attn_mask=None,
+                    is_causal=True,
+                    scale=1.0 / (self.head_dim ** 0.5)  # 显式设置缩放因子
+                )
+        except (ImportError, AttributeError):
+            # 如果新 API 不可用，回退到旧 API
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
+                output = F.scaled_dot_product_attention(
+                    xq, xk, xv,
+                    attn_mask=None,
+                    is_causal=True,
+                    scale=1.0 / (self.head_dim ** 0.5)  # 显式设置缩放因子
+                )
+                
         output = output.transpose(1, 2).reshape(bs, seq_len, -1)
         return self.wo(output), past_kv
 
@@ -180,10 +197,9 @@ class SLM(PreTrainedModel):
         self.tok_embeddings.weight = self.output.weight
         self.register_buffer(
             "pos_cis",
-            percompute_pos_cis(dim=config.dim // config.n_heads, end=config.max_seq_len * 2, theta=config.rope_theta),
+            precompute_pos_cis(dim=config.dim // config.n_heads, end=config.max_seq_len * 2, theta=config.rope_theta),
             persistent=False
         )
-        self.out = CausalLMOutputWithPast()
 
     def forward(self, input_ids: Optional[torch.Tensor] = None, past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None, use_cache: bool = False, **args):
         past_key_values = past_key_values or [None] * len(self.layers)
@@ -199,77 +215,106 @@ class SLM(PreTrainedModel):
             )
             past_kvs.append(past_kv)
         logits = self.output(self.norm(h))
-        self.out.__setitem__("logits", logits)
-        self.out.__setitem__('past_key_value', past_kvs)
-        return self.out
-    
+        
+        # 删除注释掉的代码
+        return CausalLMOutputWithPast(
+            loss=None,
+            logits=logits,
+            past_key_values=past_kvs,
+            hidden_states=None,
+            attentions=None
+        )
+            
     @torch.inference_mode()
-    def generate(self, input_ids, eos_token_id=2, max_new_tokens=512, temperature=0.75, top_p=0.9, stream=False, rp=1, use_cache=True, pad_token_id=0, **args):
+    def generate(self, input_ids, eos_token_id=151643, max_new_tokens=512, temperature=0.75, top_p=0.9, stream=False, rp=1, use_cache=True, pad_token_id=151643, **args):
         if stream:
-            return self._stream(input_ids, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args)
+            return self._stream_generate(input_ids, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args)
+        
         generated = []
         for i in range(input_ids.size(0)):
+            # 提取非填充部分
             non_pad = input_ids[i][input_ids[i] != pad_token_id].unsqueeze(0)
-            out = self._stream(input_ids, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args)
-            tokens_list = [tokens[:, -1:] for tokens in out]
-            gen = torch.cat(tokens_list, dim=-1) if tokens_list else non_pad
-            full_sequence = torch.cat([non_pad, gen], dim=-1)
-            generated.append(full_sequence)
+            if len(non_pad[0]) == 0:  # 防止空输入
+                non_pad = torch.tensor([[0]], device=input_ids.device)
+                
+            # 生成序列
+            out = list(self._stream_generate(non_pad, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args))
+            if out:
+                tokens_list = [tokens for tokens in out]
+                gen = torch.cat(tokens_list, dim=-1) if tokens_list else torch.empty((1, 0), dtype=non_pad.dtype, device=non_pad.device)
+                full_sequence = torch.cat([non_pad, gen], dim=-1)
+                generated.append(full_sequence)
+            else:
+                generated.append(non_pad)  # 如果没有生成任何内容，只返回输入
+        
+        # 填充到相同长度
         max_length = max(seq.size(1) for seq in generated)
-        generated = [
+        padded_generated = [
             torch.cat([seq, torch.full((1, max_length - seq.size(1)), pad_token_id, dtype=seq.dtype, device=seq.device)], dim=-1)
             for seq in generated
         ]
-        return torch.cat(generated, dim=0)
-
-    def _stream(self, input_ids, eos_token_id, max_new_token, temperature, top_p, rp, use_cache, **args):
-        start = input_ids.shape[1]  # 记录初始长度
+        return torch.cat(padded_generated, dim=0)
+    
+    def _stream_generate(self, input_ids, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args):
+        """优化的流式生成函数"""
+        start_pos = args.get('start_pos', 0)
         past_kvs = None
-        new_token_idx = 0
-        while new_token_idx < max_new_token:  # 基于新令牌数循环
-            if past_kvs is None:  # 首轮使用完整输入
-                out = self(input_ids, past_key_values=past_kvs, use_cache=use_cache)
-            else:  # 后续仅用最后一个令牌
-                out = self(input_ids[:, -1:], past_key_values=past_kvs, use_cache=use_cache)
+        new_tokens = []
+        
+        for new_token_idx in range(max_new_tokens):
+            # 首轮使用完整输入，后续仅用最后一个令牌
+            if past_kvs is None:
+                out = self(input_ids, past_key_values=past_kvs, use_cache=use_cache, start_pos=start_pos)
+            else:
+                out = self(input_ids[:, -1:], past_key_values=past_kvs, use_cache=use_cache, 
+                        start_pos=start_pos + input_ids.size(1) - 1)
+            
             logits, past_kvs = out.logits[:, -1, :], out.past_key_values
             
-            # 应用重复惩罚和温度调整
-            logits[:, list(set(input_ids.tolist()[0]))] /= rp
-            logits /= (temperature + 1e-9)
+            # 应用重复惩罚
+            if rp > 1.0:
+                for prev_id in input_ids[0].tolist():
+                    logits[:, prev_id] /= rp
+            
+            # 应用温度
+            if temperature > 0:
+                logits /= temperature
+            else:
+                # 贪婪解码
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                input_ids = torch.cat([input_ids, next_token], dim=-1)
+                new_tokens.append(next_token)
+                if next_token.item() == eos_token_id:
+                    break
+                continue
             
             # Top-p采样
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                sorted_probs = F.softmax(sorted_logits, dim=-1)
-                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                # 移除低概率的token
                 sorted_indices_to_remove = cumulative_probs > top_p
                 sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
                 sorted_indices_to_remove[:, 0] = False
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                logits[indices_to_remove] = float("-inf")
+                
+                # 将被移除的索引设置为-inf
+                for batch_idx in range(logits.shape[0]):
+                    indices_to_remove = sorted_indices[batch_idx][sorted_indices_to_remove[batch_idx]]
+                    logits[batch_idx, indices_to_remove] = float('-inf')
             
             # 采样并更新输入
-            input_ids_next = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
-            input_ids = torch.cat([input_ids, input_ids_next], dim=-1)
-            new_token_idx += 1
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            new_tokens.append(next_token)
             
             # 遇到EOS则提前终止
-            if input_ids_next.item() == eos_token_id:
-                print(input_ids_next)
+            if next_token.item() == eos_token_id:
                 break
-            yield input_ids[:, start:]  # 仅返回新生成的令牌
-
-def print_model_parameters(model):
-    print("Layer Name & Parameters")
-    print("-----------------------------")
-    total_params = 0
-    for name, parameter in model.named_parameters():
-        param_size = parameter.size()
-        param_count = torch.prod(torch.tensor(param_size)).item()
-        total_params += param_count
-        print(f"{name:50} | Size: {str(param_size):30} | Count: {str(param_count):20}")
-    print("-----------------------------")
-    print(f"Total Parameters: {total_params} ({total_params / 1000000:.1f} M)")
+            
+            # 返回当前生成的token
+            yield next_token
 
 if __name__ == "__main__":
     LMConfig_Dense = LMConfig()
