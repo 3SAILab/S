@@ -1,339 +1,336 @@
-# -*- coding: utf-8 -*-
-"""
-@Author: ShouqinGuan
-description: 3S architecture of a language model
-"""
-from typing import Optional, Tuple, List
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PretrainedConfig, PreTrainedModel
-from transformers.modeling_outputs import CausalLMOutputWithPast
+import math
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
-class LMConfig(PretrainedConfig):
-    model_type = "3S"
+# --- Configuration ---
+@dataclass
+class CustomLlamaConfig:
+    vocab_size: int = 32000  # Size of the vocabulary
+    hidden_size: int = 768    # Dimension of the hidden states (d_model)
+    intermediate_size: int = 2048 # Dimension of the MLP intermediate layer
+    num_hidden_layers: int = 6     # Number of transformer blocks
+    num_attention_heads: int = 8   # Number of query heads (n_heads)
+    num_key_value_heads: int = 4   # Number of key/value heads (n_kv_heads) - for GQA
+    head_dim: int = hidden_size // num_attention_heads # Dimension of each attention head
+    max_seq_len: int = 1024 # Maximum sequence length
+    rms_norm_eps: float = 1e-5     # Epsilon for RMSNorm
+    rope_theta: float = 10000.0    # RoPE base frequency
 
-    def __init__(
-        self,
-        dim: int = 1536,
-        n_layers: int = 32,
-        n_heads: int = 32,
-        n_kv_heads: int = 4,
-        vocab_size: int = 151664,
-        hidden_dim: int = None,
-        multiple_of: int = 64,
-        norm_eps: float = 1e6,
-        max_seq_len: int = 2048,
-        rope_theta: int = 1e6,
-        **kwargs
-    ):
-        self.dim = dim
-        self.n_layers = n_layers
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.vocab_size = vocab_size
-        self.hidden_dim = hidden_dim
-        self.multiple_of = multiple_of
-        self.norm_eps = norm_eps
-        self.max_seq_len = max_seq_len
-        self.rope_theta = rope_theta
-        super().__init__(**kwargs)
+# Instantiate a default config for demonstration
+config = CustomLlamaConfig()
 
-
+# --- 1. RMSNorm Implementation ---
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
+        # The gamma parameter (learnable)
         self.weight = nn.Parameter(torch.ones(dim))
-    
-    def forward(self, x: torch.Tensor):
-        return self.weight * (x.float() * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)).type_as(x)
-        
-# 修复 percompute_pos_cis 函数名拼写错误和注释
-def precompute_pos_cis(dim: int, end: int, theta: float = 10000.0):
-    """预计算位置编码的复数表示"""
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    pos_cis = torch.polar(torch.ones_like(freqs), freqs)
-    return pos_cis
 
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    # freqs_cis (b, d)  x (a, b, c, d) ->  freqs_cis (1, b, 1, d)
-    ndim = x.ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
+    def _norm(self, x):
+        # Calculate Root Mean Square along the last dimension (features)
+        # (batch_size, seq_len, hidden_size) -> computes RMS over hidden_size
+        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x / rms
 
-def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, pos_cis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x):
+        # Normalize the input and scale by the learnable gamma parameter
+        output = self._norm(x.float()).type_as(x) # Calculate in float32 for stability
+        return output * self.weight
+
+# --- 2. Rotary Positional Embedding (RoPE) ---
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    """
+    Precompute the rotational embeddings (complex numbers cis(theta*m))
+    needed for RoPE. Calculated in float32 for precision.
+    """
+    # Generates frequencies based on the dimension and theta parameter
+    # Formula: freqs = 1.0 / (theta**(torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+
+    # Generates position indices (m) from 0 to end-1
+    t = torch.arange(end, dtype=torch.float32) # Positions m = 0, 1, ..., seq_len-1
+
+    # Calculates outer product of positions and frequencies (theta * m)
+    freqs = torch.outer(t, inv_freq) # Shape: (seq_len, dim / 2)
+
+    # Converts freqs to complex numbers in polar form: R * exp(i * theta) = R * (cos(theta) + i*sin(theta))
+    # Here R=1, so it's just cis(theta*m) = cos(theta*m) + i*sin(theta*m)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs) # Shape: (seq_len, dim / 2)
+    return freqs_cis
+
+def apply_rotary_emb(
+    xq: torch.Tensor, # Query tensor (batch, seq_len, num_heads, head_dim)
+    xk: torch.Tensor, # Key tensor   (batch, seq_len, num_kv_heads, head_dim)
+    freqs_cis: torch.Tensor, # Precomputed complex frequencies (seq_len, head_dim / 2)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply Rotary Positional Embedding to query and key tensors.
+    """
+    # Reshape xq and xk to view the last dimension as complex numbers
+    # (batch, seq_len, num_heads, head_dim) -> (batch, seq_len, num_heads, head_dim/2, 2)
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(pos_cis, xq_)
-    xq_out = torch.view_as_real(freqs_cis * xq_).flatten(3)
-    xk_out = torch.view_as_real(freqs_cis * xk_).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
 
-def repeat_kv(x: torch.Tensor, n_req: int) -> torch.Tensor:
-    bs, seq_len, n_kv_heads, head_dim = x.shape
-    if n_req == 1:
-        return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, seq_len, n_kv_heads, n_req, head_dim)
-        .reshape(bs, seq_len, n_kv_heads * n_req, head_dim)
-    )
+    # Reshape freqs_cis to match the sequence length dimension of xq_ and xk_
+    # freqs_cis shape is (seq_len, head_dim/2) -> needs broadcasting for batch and head dims
+    # Add dimensions for batch and heads: (1, seq_len, 1, head_dim/2)
+    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2) # Add batch and head dims for broadcasting
+    seq_len = xq_.shape[1]
+    freqs_cis = freqs_cis[:, :seq_len, :, :] # Ensure freqs match sequence length
 
+    # Apply rotation by complex multiplication:
+    # (a + bi) * (c + di) = (ac - bd) + (ad + bc)i
+    # xq_out = xq_ * freqs_cis
+    # xk_out = xk_ * freqs_cis
+    # view_as_real converts complex back to (..., 2) shape
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3) # Flatten the last two dims
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+
+    return xq_out.type_as(xq), xk_out.type_as(xk) # Cast back to original dtype
+
+# --- 3. Grouped Query Attention (GQA) ---
 class Attention(nn.Module):
-    def __init__(self, config: LMConfig):
+    def __init__(self, config: CustomLlamaConfig):
         super().__init__()
-        self.n_kv_heads = config.n_heads if config.n_kv_heads is None else config.n_kv_heads
-        assert config.n_heads % self.n_kv_heads == 0
-        self.n_local_heads = config.n_heads
-        self.n_local_kv_heads = self.n_kv_heads  # 修正变量名
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = config.dim // config.n_heads
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        assert self.num_heads % self.num_kv_heads == 0
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads # Number of Q heads sharing one K/V head
+        self.head_dim = config.head_dim
+        self.hidden_size = config.hidden_size
 
-        self.wq = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)  # 修正输入输出维度
-    
-    def forward(self, x: torch.Tensor, pos_cis: torch.Tensor, past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, use_cache=False):
-        bs, seq_len, _ = x.shape
+        # Linear layers for Q, K, V projections
+        self.wq = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=False)
+        self.wk = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
+        self.wv = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
+
+        # Output projection layer
+        self.wo = nn.Linear(config.num_attention_heads * config.head_dim, config.hidden_size, bias=False)
+
+    def _repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        Repeat K/V heads n_rep times to match the number of query heads.
+        Input shape: (batch, seq_len, num_kv_heads, head_dim)
+        Output shape: (batch, seq_len, num_heads, head_dim)
+        """
+        if n_rep == 1:
+            return x
+        batch, seq_len, num_kv_heads, head_dim = x.shape
+        x = x.unsqueeze(3).expand(batch, seq_len, num_kv_heads, n_rep, head_dim)
+        return x.reshape(batch, seq_len, num_kv_heads * n_rep, head_dim)
+
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor] = None # Causal mask
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+
+        # 1. Project to Q, K, V
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        xq = xq.view(bs, seq_len, self.n_local_heads, self.head_dim)
-        xk = xk.view(bs, seq_len, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bs, seq_len, self.n_local_kv_heads, self.head_dim)
-        
-        # 修复这里的错误，应该是xq和xk应用旋转位置编码
-        xq, xk = apply_rotary_emb(xq, xk, pos_cis)
 
-        if past_key_value is not None:
-            xk = torch.cat([past_key_value[0], xk], dim=1)
-            xv = torch.cat([past_key_value[1], xv], dim=1)
-        past_kv = (xk, xv) if use_cache else None
-        
-        # 转置维度以适应注意力计算
-        xq, xk, xv = (
-            xq.transpose(1, 2),
-            repeat_kv(xk, self.n_rep).transpose(1, 2),
-            repeat_kv(xv, self.n_rep).transpose(1, 2)
-        )
+        # 2. Reshape for multi-head attention
+        # (batch, seq_len, num_heads * head_dim) -> (batch, seq_len, num_heads, head_dim)
+        xq = xq.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        xk = xk.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        xv = xv.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
-        # 使用新的 torch.nn.attention.sdpa_kernel 替代旧的 sdp_kernel
-        try:
-            # 尝试使用新的 API
-            from torch.nn.attention import sdpa_kernel
-            with sdpa_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
-                output = F.scaled_dot_product_attention(
-                    xq, xk, xv,
-                    attn_mask=None,
-                    is_causal=True,
-                    scale=1.0 / (self.head_dim ** 0.5)  # 显式设置缩放因子
-                )
-        except (ImportError, AttributeError):
-            # 如果新 API 不可用，回退到旧 API
-            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
-                output = F.scaled_dot_product_attention(
-                    xq, xk, xv,
-                    attn_mask=None,
-                    is_causal=True,
-                    scale=1.0 / (self.head_dim ** 0.5)  # 显式设置缩放因子
-                )
-                
-        output = output.transpose(1, 2).reshape(bs, seq_len, -1)
-        return self.wo(output), past_kv
+        # 3. Apply RoPE
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
+        # 4. Repeat K and V heads for GQA
+        xk = self._repeat_kv(xk, self.num_queries_per_kv) # (batch, seq_len, num_heads, head_dim)
+        xv = self._repeat_kv(xv, self.num_queries_per_kv) # (batch, seq_len, num_heads, head_dim)
+
+        # 5. Transpose for attention calculation: (batch, num_heads, seq_len, head_dim)
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+
+        # 6. Scaled Dot-Product Attention
+        # (batch, num_heads, seq_len, head_dim) @ (batch, num_heads, head_dim, seq_len)
+        # -> (batch, num_heads, seq_len, seq_len)
+        scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        # Apply causal mask
+        if mask is not None:
+            # mask shape should be (1, 1, seq_len, seq_len) or broadcastable
+            scores = scores + mask # Masked positions get large negative values
+
+        # Softmax converts scores to probabilities/weights
+        attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).type_as(xq)
+
+        # (batch, num_heads, seq_len, seq_len) @ (batch, num_heads, seq_len, head_dim)
+        # -> (batch, num_heads, seq_len, head_dim)
+        output = torch.matmul(attn_weights, xv)
+
+        # 7. Concatenate heads and project output
+        # (batch, num_heads, seq_len, head_dim) -> (batch, seq_len, num_heads, head_dim)
+        output = output.transpose(1, 2).contiguous()
+        # (batch, seq_len, num_heads, head_dim) -> (batch, seq_len, hidden_size)
+        output = output.view(batch_size, seq_len, self.hidden_size)
+
+        # Final linear projection
+        output = self.wo(output)
+        return output
+
+# --- 4. SwiGLU Feed-Forward Network ---
 class FeedForward(nn.Module):
-    def __init__(self, config: LMConfig):
+    def __init__(self, config: CustomLlamaConfig):
         super().__init__()
-        if config.hidden_dim is None:
-            hidden_dim = 4 * config.dim
-            hidden_dim = int(2 * hidden_dim / 3)
-            config.hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of) 
-        self.w1 = nn.Linear(config.dim, config.hidden_dim, bias=False)
-        self.w2 = nn.Linear(config.hidden_dim, config.dim, bias=False)
-        self.w3 = nn.Linear(config.dim, config.hidden_dim, bias=False)
+        hidden_dim = config.hidden_size
+        intermediate_dim = config.intermediate_size
 
-    def forward(self, x: torch.Tensor):
-        return self.w2(F.silu(self.w1(x) * self.w3(x)))
-        
+        # Llama uses SwiGLU FFN: w2(swish(w1(x)) * w3(x))
+        self.w1 = nn.Linear(hidden_dim, intermediate_dim, bias=False) # Gate projection
+        self.w3 = nn.Linear(hidden_dim, intermediate_dim, bias=False) # Up projection
+        self.w2 = nn.Linear(intermediate_dim, hidden_dim, bias=False) # Down projection
 
+    def forward(self, x):
+        # Apply Swish (SiLU) to the gate projection w1(x)
+        swish_gate = F.silu(self.w1(x))
+        # Project x up with w3(x)
+        x_up = self.w3(x)
+        # Element-wise multiply the Swish gate and the up-projected tensor
+        gated = swish_gate * x_up
+        # Project down to the hidden dimension
+        output = self.w2(gated)
+        return output
+
+# --- 5. Transformer Block ---
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, config: LMConfig):
+    def __init__(self, config: CustomLlamaConfig):
         super().__init__()
-        self.n_heads = config.n_heads
-        self.dim = config.dim
-        self.head_dim = config.dim // config.n_heads
-        self.attn = Attention(config)
+        self.attention = Attention(config)
+        self.feed_forward = FeedForward(config)
+        self.attention_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.layer_id = layer_id
-        self.attn_norm = RMSNorm(config.dim, eps=config.norm_eps)
-        self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
-        self.ffn = FeedForward(config)
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        # Pre-normalization and Attention + Residual connection
+        # h = x + Attention(RMSNorm(x))
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask)
 
-    def forward(self, x: torch.Tensor, pos_cis: torch.Tensor, past_key_value=None, use_cache: bool = False):      
-        h_attn, past_kv = self.attn(
-            self.attn_norm(x),
-            pos_cis,
-            past_key_value=past_key_value,
-            use_cache=use_cache
-        )
-        h = x + h_attn
-        out = h + self.ffn(self.ffn_norm(h))
-        return out, past_kv
-    
-class SLM(PreTrainedModel):
-    config_class = LMConfig
-    def __init__(self, config: LMConfig = None):
+        # Pre-normalization and FeedForward + Residual connection
+        # out = h + FeedForward(RMSNorm(h))
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
+
+# --- 6. Overall Llama Model ---
+class CustomLlamaModel(nn.Module):
+    def __init__(self, config: CustomLlamaConfig):
+        super().__init__()
         self.config = config
-        super().__init__(self.config)
-        self.vocab_size, self.n_layers = config.vocab_size, config.n_layers
-        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
-        self.layers = nn.ModuleList([TransformerBlock(l, config) for l in range(self.n_layers)])
-        self.norm = RMSNorm(config.dim, config.norm_eps)
-        self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
-        self.tok_embeddings.weight = self.output.weight
-        self.register_buffer(
-            "pos_cis",
-            precompute_pos_cis(dim=config.dim // config.n_heads, end=config.max_seq_len * 2, theta=config.rope_theta),
-            persistent=False
+
+        # Token Embeddings
+        self.tok_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+
+        # Transformer Blocks
+        self.layers = nn.ModuleList(
+            [TransformerBlock(config) for _ in range(config.num_hidden_layers)]
         )
 
-    def forward(self, input_ids: Optional[torch.Tensor] = None, past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None, use_cache: bool = False, **args):
-        past_key_values = past_key_values or [None] * len(self.layers)
-        start_pos = args.get('start_pos', 0)
-        h = self.tok_embeddings(input_ids)
-        pos_cis = self.pos_cis[start_pos: start_pos + input_ids.size(1)]
-        past_kvs = []
-        for l, layer in enumerate(self.layers):
-            h, past_kv = layer(
-                h, pos_cis, 
-                past_key_value=past_key_values[l],
-                use_cache=use_cache
-            )
-            past_kvs.append(past_kv)
-        logits = self.output(self.norm(h))
-        
-        # 删除注释掉的代码
-        return CausalLMOutputWithPast(
-            loss=None,
-            logits=logits,
-            past_key_values=past_kvs,
-            hidden_states=None,
-            attentions=None
-        )
-            
-    @torch.inference_mode()
-    def generate(self, input_ids, eos_token_id=151643, max_new_tokens=512, temperature=0.75, top_p=0.9, stream=False, rp=1, use_cache=True, pad_token_id=151643, **args):
-        if stream:
-            return self._stream_generate(input_ids, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args)
-        
-        generated = []
-        for i in range(input_ids.size(0)):
-            # 提取非填充部分
-            non_pad = input_ids[i][input_ids[i] != pad_token_id].unsqueeze(0)
-            if len(non_pad[0]) == 0:  # 防止空输入
-                non_pad = torch.tensor([[0]], device=input_ids.device)
-                
-            # 生成序列
-            out = list(self._stream_generate(non_pad, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args))
-            if out:
-                tokens_list = [tokens for tokens in out]
-                gen = torch.cat(tokens_list, dim=-1) if tokens_list else torch.empty((1, 0), dtype=non_pad.dtype, device=non_pad.device)
-                full_sequence = torch.cat([non_pad, gen], dim=-1)
-                generated.append(full_sequence)
-            else:
-                generated.append(non_pad)  # 如果没有生成任何内容，只返回输入
-        
-        # 填充到相同长度
-        max_length = max(seq.size(1) for seq in generated)
-        padded_generated = [
-            torch.cat([seq, torch.full((1, max_length - seq.size(1)), pad_token_id, dtype=seq.dtype, device=seq.device)], dim=-1)
-            for seq in generated
-        ]
-        return torch.cat(padded_generated, dim=0)
-    
-    def _stream_generate(self, input_ids, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, **args):
-        """优化的流式生成函数"""
-        start_pos = args.get('start_pos', 0)
-        past_kvs = None
-        new_tokens = []
-        
-        for new_token_idx in range(max_new_tokens):
-            # 首轮使用完整输入，后续仅用最后一个令牌
-            if past_kvs is None:
-                out = self(input_ids, past_key_values=past_kvs, use_cache=use_cache, start_pos=start_pos)
-            else:
-                out = self(input_ids[:, -1:], past_key_values=past_kvs, use_cache=use_cache, 
-                        start_pos=start_pos + input_ids.size(1) - 1)
-            
-            logits, past_kvs = out.logits[:, -1, :], out.past_key_values
-            
-            # 应用重复惩罚
-            if rp > 1.0:
-                for prev_id in input_ids[0].tolist():
-                    logits[:, prev_id] /= rp
-            
-            # 应用温度
-            if temperature > 0:
-                logits /= temperature
-            else:
-                # 贪婪解码
-                next_token = torch.argmax(logits, dim=-1, keepdim=True)
-                input_ids = torch.cat([input_ids, next_token], dim=-1)
-                new_tokens.append(next_token)
-                if next_token.item() == eos_token_id:
-                    break
-                continue
-            
-            # Top-p采样
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                
-                # 移除低概率的token
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-                sorted_indices_to_remove[:, 0] = False
-                
-                # 将被移除的索引设置为-inf
-                for batch_idx in range(logits.shape[0]):
-                    indices_to_remove = sorted_indices[batch_idx][sorted_indices_to_remove[batch_idx]]
-                    logits[batch_idx, indices_to_remove] = float('-inf')
-            
-            # 采样并更新输入
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
-            new_tokens.append(next_token)
-            
-            # 遇到EOS则提前终止
-            if next_token.item() == eos_token_id:
-                break
-            
-            # 返回当前生成的token
-            yield next_token
+        # Final normalization layer
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # Language Model Head (Output layer)
+        self.output = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Precompute RoPE frequencies
+        self.freqs_cis = precompute_freqs_cis(
+            # RoPE is typically applied to a fraction of the head dimension (e.g., 128)
+            # Or sometimes the full head dimension. Let's use head_dim for simplicity here.
+            # Need to confirm exact Llama3 RoPE dimension application if critical.
+            self.config.head_dim,
+            self.config.max_seq_len * 2, # Multiply by 2 for flexibility, might need adjustment
+            theta=self.config.rope_theta
+        )
+
+        # Cache for the causal mask (optional, can be built on the fly)
+        self._mask_cache: Optional[torch.Tensor] = None
+
+    def _build_causal_mask(self, seq_len: int) -> torch.Tensor:
+        # Builds an upper-triangular mask for causal attention.
+        # If mask exists and is large enough, reuse it.
+        if self._mask_cache is not None and self._mask_cache.shape[-1] >= seq_len:
+            return self._mask_cache[:, :, :seq_len, :seq_len]
+
+        mask = torch.full((1, 1, seq_len, seq_len), float("-inf"))
+        mask = torch.triu(mask, diagonal=1) # Creates upper triangle matrix of -inf
+        self._mask_cache = mask.type(torch.get_default_dtype()) # Use model's default dtype
+        return self._mask_cache
+
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len = tokens.shape
+        assert seq_len <= self.config.max_seq_len, \
+            f"Sequence length {seq_len} exceeds model max length {self.config.max_seq_len}"
+
+        # 1. Get Token Embeddings
+        h = self.tok_embeddings(tokens) # (batch, seq_len, hidden_size)
+
+        # 2. Retrieve precomputed RoPE frequencies for the current sequence length
+        # Needs to be on the same device as the input tensor `h`
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[:seq_len]
+
+        # 3. Build or retrieve the causal attention mask
+        mask = self._build_causal_mask(seq_len).to(h.device)
+
+        # 4. Pass through Transformer Blocks
+        for layer in self.layers:
+            h = layer(h, freqs_cis, mask)
+
+        # 5. Final Normalization
+        h = self.norm(h)
+
+        # 6. Language Model Head (Output logits)
+        output = self.output(h) # (batch, seq_len, vocab_size)
+
+        # Return logits (usually in float32 for stability in loss calculation)
+        return output.float()
+
+# --- Example Usage ---
 if __name__ == "__main__":
-    LMConfig_Dense = LMConfig()
-    S_Dense = SLM(LMConfig_Dense)
+    # Use the default config defined earlier
+    model_config = CustomLlamaConfig()
+    print("Model Configuration:")
+    print(model_config)
 
-    # 生成测试输入 - 形状为 (4, 2047) 的整数张量，值在 0-999 之间
-    test_input = torch.randint(low=0, high=151643, size=(4, 2047))
-    
-    # 测试模型
-    with torch.no_grad():
-        # 前向传播
-        output = S_Dense(test_input)
-        logits = output.logits
-        # 检查输出形状
-        print(f"Output shape: {logits.shape}")  # 应该是 (4, 2047, vocab_size)
-        
-        # 检查输出值
-        print(f"Sample output values (first 5 of first sequence):")
-        # 检查概率分布是否合理
-        probs = torch.softmax(logits, dim=-1)
-        print("\nProbability sums (should be ~1.0):")
-        print(probs[0, :5, :].sum(dim=-1))  # 检查概率是否归一化
+    # Instantiate the custom model
+    model = CustomLlamaModel(model_config)
+    print(f"\nModel Instantiated. Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+    # Create a dummy input tensor (batch_size=2, seq_len=10)
+    # Token IDs should be within the vocab_size range
+    dummy_input = torch.randint(0, model_config.vocab_size, (2, 10))
+    print(f"\nDummy Input Shape: {dummy_input.shape}")
+
+    # Set model to evaluation mode (if not training)
+    model.eval()
+
+    # Perform a forward pass
+    with torch.no_grad(): # Disable gradient calculation for inference
+        logits = model(dummy_input)
+
+    print(f"Output Logits Shape: {logits.shape}") # Should be (batch_size, seq_len, vocab_size)
+
+    # You can now use this 'model' object in your training loop.
+    # Calculate loss using logits and target token IDs (e.g., with nn.CrossEntropyLoss)
+    # Example loss calculation:
+    # criterion = nn.CrossEntropyLoss()
+    # dummy_targets = torch.randint(0, model_config.vocab_size, (2, 10))
+    # # Reshape logits and targets for CrossEntropyLoss: (Batch * SeqLen, VocabSize) and (Batch * SeqLen)
+    # loss = criterion(logits.view(-1, model_config.vocab_size), dummy_targets.view(-1))
+    # print(f"Example Loss: {loss.item()}") # Requires dummy_targets
