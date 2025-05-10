@@ -1,0 +1,53 @@
+# 路径配置
+paths:
+  tokenizer_path: "/home/ps/llm/pretrain/tokenizer"
+  pretrain_data_file: "/home/ps/llm/pretrain/dataset/news.bin"
+  output_dir: "./news_output"
+  default_checkpoint_file: "custom_llama_checkpoint.pt"
+  final_model_file: "custom_llama_final.pt"
+  loss_plot_file: "custom_pretrain_loss_curve.png"
+
+# 训练超参数
+training:
+  # 基本训练参数
+  num_epochs: 2
+  batch_size: 4
+  num_workers: 4
+  gradient_accumulation_steps: 8
+  lr: 5e-4
+  min_lr: 1e-6
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  seed: 42
+  resume_from_checkpoint: /home/ps/llm/pretrain/news_output/checkpoint_epoch0_step2250.pt
+  gpu_ids: 0,1,2,3
+  world_size: 4
+  use_amp: true
+
+# 日志和保存配置
+logging:
+  log_interval: 250  # 每N * gradient_accumulation_steps步记录一次损失
+  save_interval: 750  # 每N * gradient_accumulation_steps步保存一次检查点
+
+# 模型配置
+model:
+  # 模型架构参数
+  hidden_size: 768  # 隐藏层维度
+  intermediate_size: 1024  # 前馈网络中间层维度
+  num_hidden_layers: 12  # Transformer层数
+  num_attention_heads: 8  # 注意力头数
+  num_key_value_heads: 4  # KV注意力头数（用于分组查询注意力）
+  vocab_size: 151666
+  max_seq_len: 1024
+  rms_norm_eps: 1e-5
+  rope_theta: 10000.0
+
+
+# 推理配置
+inference:
+  default_prompt: "太阳从"
+  max_new_tokens: 50
+  temperature: 0.8
+  top_k: 50
+  top_p: 0.9
+  repetition_penalty: 1.1 
